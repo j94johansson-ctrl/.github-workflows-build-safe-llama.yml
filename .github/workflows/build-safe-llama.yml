@@ -8,97 +8,187 @@ jobs:
     runs-on: windows-2022
 
     steps:
-      - name: Checkout llama-cpp-python
-        uses: actions/checkout@v6
-        with:
-          repository: abetlen/llama-cpp-python
-          ref: main
-          submodules: recursive
+      # ---------------------------------------------------
+      # Avoid Windows MAX_PATH problems
+      # ---------------------------------------------------
 
-      - name: Set up Python
+      - name: Enable long Windows paths
+        shell: pwsh
+        run: |
+          git config --global core.longpaths true
+          git config --global core.autocrlf false
+
+      - name: Clone llama-cpp-python to short path
+        shell: pwsh
+        run: |
+          if (Test-Path "C:\lcp") {
+            Remove-Item "C:\lcp" -Recurse -Force
+          }
+
+          git clone `
+            https://github.com/abetlen/llama-cpp-python.git `
+            C:\lcp
+
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+          Set-Location C:\lcp
+
+          git config core.longpaths true
+
+          git submodule update `
+            --init `
+            --recursive
+
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+          Write-Host ""
+          Write-Host "llama-cpp-python:"
+          git rev-parse HEAD
+
+          Write-Host ""
+          Write-Host "llama.cpp:"
+          git submodule status
+
+      # ---------------------------------------------------
+      # Python
+      # ---------------------------------------------------
+
+      - name: Set up Python 3.12
         uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+
+      # ---------------------------------------------------
+      # MSVC
+      # ---------------------------------------------------
 
       - name: Set up MSVC
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
+      # ---------------------------------------------------
+      # Miniconda / CUDA
+      # ---------------------------------------------------
+
       - name: Set up Miniconda
-        uses: conda-incubator/setup-miniconda@v4
+        uses: conda-incubator/setup-miniconda@v4.0.1
         with:
           activate-environment: llamacpp
           python-version: "3.12"
           miniforge-version: latest
+          add-pip-as-python-dependency: true
+          auto-activate-base: false
 
-      - name: Install CUDA 12.4 build tools
+      - name: Install CUDA 12.4.1
         shell: pwsh
+        working-directory: C:\lcp
+        env:
+          MAMBA_DOWNLOAD_FAILFAST: "0"
+          MAMBA_NO_LOW_SPEED_LIMIT: "1"
         run: |
-          $cudaChannel = "nvidia/label/cuda-12.4.1"
+          $cudaVersion = "12.4.1"
+          $cudaChannel = "nvidia/label/cuda-$cudaVersion"
 
           mamba install -y `
             --channel-priority flexible `
             --override-channels `
             -c $cudaChannel `
+            "${cudaChannel}::cuda-toolkit=$cudaVersion" `
             "${cudaChannel}::cuda-nvcc_win-64" `
             "${cudaChannel}::cuda-cccl" `
-            "${cudaChannel}::cuda-libraries-dev=12.4.1" `
             "${cudaChannel}::cuda-cudart" `
             "${cudaChannel}::cuda-cudart-dev"
 
-      - name: Install build tools
-        shell: pwsh
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install build wheel ninja
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
 
-      - name: Locate CUDA
+          python -m pip install `
+            build `
+            wheel `
+            ninja
+
+      # ---------------------------------------------------
+      # Build custom wheel
+      # ---------------------------------------------------
+
+      - name: Build safe RTX 3500 CUDA wheel
         shell: pwsh
+        working-directory: C:\lcp
         run: |
           $cudaRoot = Join-Path $env:CONDA_PREFIX "Library"
 
-          $nvcc = @(
+          $env:CUDA_PATH = $cudaRoot
+          $env:CUDA_HOME = $cudaRoot
+          $env:CUDAToolkit_ROOT = $cudaRoot
+          $env:CUDA_TOOLKIT_ROOT_DIR = $cudaRoot
+
+          $env:PATH = `
+            "$(Join-Path $cudaRoot 'bin');" +
+            $env:PATH
+
+          $nvccCandidates = @(
+            (Join-Path $cudaRoot "bin\nvcc.exe"),
             (Join-Path $env:CONDA_PREFIX "Library\bin\nvcc.exe"),
             (Join-Path $env:CONDA_PREFIX "bin\nvcc.exe")
-          ) |
-          Where-Object { Test-Path $_ } |
-          Select-Object -First 1
+          )
+
+          $nvcc = $nvccCandidates |
+            Where-Object { Test-Path $_ } |
+            Select-Object -First 1
 
           if (-not $nvcc) {
             throw "nvcc.exe not found"
           }
 
-          "CUDA_ROOT=$cudaRoot" >> $env:GITHUB_ENV
-          "NVCC_PATH=$nvcc" >> $env:GITHUB_ENV
+          Write-Host ""
+          Write-Host "NVCC:"
+          Write-Host $nvcc
 
           & $nvcc --version
 
-      - name: Build safe CUDA wheel
-        shell: pwsh
-        run: |
-          $cudaRoot = $env:CUDA_ROOT
-          $nvcc = $env:NVCC_PATH
+          $ninja = (Get-Command ninja -ErrorAction Stop).Source
 
           $cudaRootCmake = $cudaRoot.Replace('\','/')
           $nvccCmake = $nvcc.Replace('\','/')
+          $ninjaCmake = $ninja.Replace('\','/')
 
-          $env:CUDA_PATH = $cudaRoot
-          $env:CUDA_HOME = $cudaRoot
-          $env:CUDAToolkit_ROOT = $cudaRoot
           $env:CUDACXX = $nvccCmake
           $env:CMAKE_GENERATOR = "Ninja"
+          $env:CMAKE_MAKE_PROGRAM = $ninjaCmake
 
-          $env:CMAKE_ARGS = @(
+          #
+          # RTX 3500 Ada = compute capability 8.9
+          #
+          # CPU:
+          # Intel i9-13950HX
+          # AVX2 YES
+          # AVX512 NO
+          #
+
+          $args = @(
             "-DGGML_CUDA=ON"
             "-DGGML_CUDA_FORCE_MMQ=ON"
+
             "-DCMAKE_CUDA_ARCHITECTURES=89"
             "-DCMAKE_CUDA_COMPILER=$nvccCmake"
+            "-DCMAKE_CUDA_COMPILER_ARG1=-allow-unsupported-compiler"
+            "-DCMAKE_CUDA_FLAGS=-allow-unsupported-compiler"
+
             "-DCUDAToolkit_ROOT=$cudaRootCmake"
+            "-DCUDA_TOOLKIT_ROOT_DIR=$cudaRootCmake"
+
+            "-DCMAKE_MAKE_PROGRAM=$ninjaCmake"
 
             "-DGGML_NATIVE=OFF"
             "-DGGML_CPU_ALL_VARIANTS=OFF"
 
+            "-DGGML_SSE42=ON"
             "-DGGML_AVX=ON"
             "-DGGML_AVX2=ON"
 
@@ -108,23 +198,47 @@ jobs:
             "-DGGML_AVX512_BF16=OFF"
 
             "-DGGML_LLAMAFILE=OFF"
-          ) -join " "
+          )
 
-          Write-Host "CMAKE_ARGS:"
+          $env:CMAKE_ARGS = $args -join " "
+
+          Write-Host ""
+          Write-Host "=============================================="
+          Write-Host "CMAKE_ARGS"
+          Write-Host "=============================================="
           Write-Host $env:CMAKE_ARGS
+          Write-Host ""
 
           python -m build --wheel
 
-      - name: Show wheel
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+      # ---------------------------------------------------
+      # Show result
+      # ---------------------------------------------------
+
+      - name: Show generated wheel
         shell: pwsh
+        working-directory: C:\lcp
         run: |
-          Get-ChildItem dist\*.whl |
+          Write-Host ""
+          Write-Host "=============================================="
+          Write-Host "GENERATED WHEEL"
+          Write-Host "=============================================="
+
+          Get-ChildItem .\dist\*.whl |
             Select-Object Name, Length, FullName |
             Format-Table -AutoSize
 
-      - name: Upload wheel
+      # ---------------------------------------------------
+      # Upload wheel
+      # ---------------------------------------------------
+
+      - name: Upload custom wheel
         uses: actions/upload-artifact@v7
         with:
-          name: llama-cpp-python-win-cu124-safe
-          path: dist/*.whl
+          name: llama-cpp-python-win-cu124-rtx3500-safe
+          path: C:\lcp\dist\*.whl
           if-no-files-found: error
